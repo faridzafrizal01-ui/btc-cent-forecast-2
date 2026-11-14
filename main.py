@@ -1,97 +1,80 @@
-#!/usr/bin/env python3
-"""Bitcoin price, 4 hours ahead: one point forecast per case.
+"""BTC 4h-ahead point forecaster for make.fun btc-cent-forecast-01.
 
-Entry for make.fun competition btc-cent-forecast-01.
+One guess per case. The working assumption is that Bitcoin's price
+four hours ahead is usually close to the checkpoint close, but after a
+sharp move over the previous 240 minutes it tends to give part of that
+move back. So the guess starts at the checkpoint close and fades a
+bounded slice of the last-240-minute move: the fade is a tanh of the
+move, which caps it at 0.3 * 400 = 120 price units no matter how far
+the market ran. The result is then clamped onto the scorer's
+5-decimal grid strictly inside (0, 10_000_000).
 
-Each case file holds 4,320 one-minute closes for the market btc-usdc; the
-last close is the checkpoint. The score is the mean absolute error across
-cases, in cents, and a prize needs a score strictly below the house
-baseline (persistence: guess the checkpoint close). Persistence ties the
-baseline exactly, so it can never win. This entry therefore starts from
-the checkpoint close and pulls a little of the last 4-hour move back:
-
-    guess = x - 0.3 * 400 * tanh((x - p240) / 400)
-
-with x the checkpoint close and p240 the close 240 minutes earlier. The
-practice cases show that after a large 4-hour move the price tends to
-snap back over the next 4 hours, so fading the move helps; the tanh
-bounds the fade at $120 and keeps it roughly proportional for small
-moves. No drift term is added: the practice window drifted down, but a
-drift is a regime, not a law, and betting on it continuing would be a
-directional gamble.
-
-Backtest on the 6 official practice cases: persistence 44,521.58 cents,
-this entry 44,399.80 cents (-0.27%); rolling backtest over every 10th
-minute of the six 72-hour histories (n = 2,412): -0.26%. The edge is
-small and regime-dependent, so the final is close to a coin flip with a
-slight positive lean -- the honest picture for a 4-hour-ahead BTC price,
-which is close to a martingale. This entry takes the small bounded edge
-the data do support rather than tying the baseline and guaranteeing no
-prize.
-
-Deterministic: a pure function of the case file. No randomness, no clock,
-no network. Standard library only.
+Standard library only. Deterministic: no randomness, no clock, no
+network. Input and output directories come from the environment.
 """
 
 import json
 import math
 import os
+from pathlib import Path
 
-IN_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-OUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-
-# Grid of the scorer: prices live on 5 decimals, inside (0, 10,000,000).
-STEP = 0.00001
-TOP = 9999999.99999
-
-# Fade constants, in dollars, fixed for every case -- never fitted per case.
-STRENGTH = 0.3
-SCALE = 400.0
+LOOKBACK = 240            # minutes back to the reference close
+FADE_SHARE = 0.3          # fraction of the scaled move to fade back
+TANH_SCALE = 400.0        # tanh scale, in the same units as prices
+GRID_LOW = 0.00001        # smallest price the scorer accepts
+GRID_HIGH = 9999999.99999  # largest price the scorer accepts
+GRID_PLACES = 5           # scorer's price grid, in decimals
 
 
-def snap(price):
-    """Clamp a raw guess onto the scorer's grid, strictly inside (0, 10M).
+def read_closes(path):
+    """Load one <id>.in case file and return its list of closes."""
+    with path.open() as handle:
+        case = json.load(handle)
 
-    Rounding to the grid after clamping keeps the value representable:
-    a raw guess like 73833.1234567 becomes 73833.12346, never 0 and never
-    at or above the 10,000,000 cap. Multiplying by 1e5 before rounding
-    (rather than dividing by the step) keeps the printed value on exactly
-    5 decimals instead of a float artefact like 74831.90714000001.
-    """
-    clipped = min(TOP, max(STEP, price))
-    return round(clipped * 1e5) / 1e5
+    markets = case.get("markets")
+    if not isinstance(markets, list) or len(markets) != 1:
+        raise ValueError(f"{path.name}: expected exactly one market")
+
+    prices = markets[0].get("prices")
+    if not isinstance(prices, list) or not prices:
+        raise ValueError(f"{path.name}: missing or empty price list")
+
+    last = prices[-1]
+    if isinstance(last, bool) or not isinstance(last, (int, float)):
+        raise ValueError(f"{path.name}: last close is not numeric")
+    if not math.isfinite(last):
+        raise ValueError(f"{path.name}: last close is not finite")
+
+    return prices
 
 
-def predict(closes):
-    """Forecast the price 240 minutes after the last close in `closes`."""
-    if not closes:
-        raise ValueError("case has no price history")
-    last = closes[-1]
-    if not isinstance(last, (int, float)) or not math.isfinite(last):
-        raise ValueError("last close is not a finite number")
-    if len(closes) > 240:
-        move = last - closes[-241]
-        guess = last - STRENGTH * SCALE * math.tanh(move / SCALE)
+def guess_price(prices):
+    """One forecast for a list of closes; the last close is the checkpoint."""
+    x = prices[-1]
+    if len(prices) > LOOKBACK:
+        p240 = prices[-LOOKBACK - 1]
+        # tanh keeps the fade bounded: at most FADE_SHARE * TANH_SCALE
+        # (= 120) even after an extreme 4-hour run, and near-linear
+        # for small moves, so ordinary drift is faded proportionally.
+        guess = x - FADE_SHARE * TANH_SCALE * math.tanh((x - p240) / TANH_SCALE)
     else:
-        guess = last
-    return snap(guess)
+        guess = x
+    clipped = min(GRID_HIGH, max(GRID_LOW, guess))
+    return round(clipped * 10 ** GRID_PLACES) / 10 ** GRID_PLACES
 
 
-def run():
-    os.makedirs(OUT_DIR, exist_ok=True)
-    for filename in sorted(os.listdir(IN_DIR)):
-        if not filename.endswith(".in"):
-            continue
-        case_id = filename[: -len(".in")]
-        with open(os.path.join(IN_DIR, filename), encoding="utf-8") as fh:
-            case = json.load(fh)
-        markets = case.get("markets")
-        if not isinstance(markets, list) or len(markets) != 1:
-            raise ValueError(f"{filename}: expected exactly one market")
-        price = predict(markets[0]["prices"])
-        with open(os.path.join(OUT_DIR, case_id + ".out"), "w", encoding="utf-8") as fh:
-            fh.write(json.dumps({"forecasts": [{"case": case_id, "price": price}]}) + "\n")
+def main():
+    input_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+    output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for in_path in sorted(input_dir.glob("*.in")):
+        case_id = in_path.stem
+        price = guess_price(read_closes(in_path))
+        payload = {"forecasts": [{"case": case_id, "price": price}]}
+        with (output_dir / f"{case_id}.out").open("w") as handle:
+            handle.write(json.dumps(payload) + "\n")
 
 
 if __name__ == "__main__":
-    run()
+    main()
